@@ -6,7 +6,9 @@ from quri_parts.core.operator import get_sparse_matrix
 from quri_parts.pyscf.mol import get_spin_mo_integrals_from_mole
 from quri_parts.openfermion.mol import get_qubit_mapped_hamiltonian
 from quri_parts.openfermion.ansatz import TrotterUCCSD
-from quri_parts.qulacs.estimator import create_qulacs_vector_concurrent_parametric_estimator
+from quri_parts.qulacs.estimator import (
+    create_qulacs_vector_concurrent_parametric_estimator,
+)
 from quri_parts.core.state import quantum_state, apply_circuit
 from quri_vm import VM
 from quri_parts.backend.devices import star_device
@@ -14,65 +16,94 @@ from quri_parts.backend.units import TimeUnit, TimeValue
 from quri_parts.circuit import ImmutableQuantumCircuit
 from quri_parts.core.sampling import ConcurrentSampler, MeasurementCounts
 from quri_parts_qsci import qsci
+from quri_parts.chem.mol import ActiveSpace, cas
+from quri_parts.chem.mol import ActiveSpaceMolecularOrbitals
 
 TROTTER_STEPS = 1
 USE_SINGLES = True
 REDUCE_PARAMETER = True
-TOTAL_SHOTS = 1000
-ERROR_RATE = 1e-4
+TOTAL_SHOTS = 1000000
+ERROR_RATE = 0  # adds device-level noise.
 
 
-class QSCI():
+class QSCI:
 
     def __init__(self):
         pass
 
-    def run(self, molecule):
-        mf = scf.RHF(molecule).run(verbose=0)
+    def run(self, molecule, frozen=None):
+        n_frozen = len(frozen) if frozen else 0
+        print("n_frozen", n_frozen)
+        n_orbitals = molecule.nao * 2 - 2 * n_frozen
+        n_electrons = molecule.nelectron - 2 * n_frozen
+
+        if frozen is not None:
+            active_orbs_indices = [i for i in range(molecule.nao) if i not in frozen]
+        else:
+            active_orbs_indices = None
 
         # Find Hamiltonian.
+        mf = scf.RHF(molecule).run(verbose=0)
+        active_space = cas(
+            n_active_ele=n_electrons,
+            n_active_orb=n_orbitals // 2,
+            active_orbs_indices=active_orbs_indices,
+        )
+        print(active_space)
+        print(active_orbs_indices)
+
         hamiltonian, mapping = get_qubit_mapped_hamiltonian(
-            *get_spin_mo_integrals_from_mole(molecule, mf.mo_coeff)
+            *get_spin_mo_integrals_from_mole(molecule, mf.mo_coeff, active_space)
         )
 
         # Find bound-state.
         uccsd = TrotterUCCSD(
-            molecule.nao * 2,
-            molecule.nelectron,
+            n_orbitals,
+            n_electrons,
             trotter_number=TROTTER_STEPS,
             use_singles=USE_SINGLES,
             singlet_excitation=REDUCE_PARAMETER,
         )
-        ccsd = cc.CCSD(mf).run(verbose=0)
-        param = self.ccsd_param_to_circuit_param(uccsd, molecule.nelectron, ccsd.t1, ccsd.t2)
+        ccsd = cc.CCSD(mf)
+        ccsd.frozen = frozen
+        ccsd.kernel()
+        param = self.ccsd_param_to_circuit_param(uccsd, n_electrons, ccsd.t1, ccsd.t2)
 
-        hf_state = quantum_state(molecule.nao * 2, bits=2 ** molecule.nelectron - 1)
+        hf_state = quantum_state(n_orbitals, bits=2**n_electrons - 1)
         state = apply_circuit(uccsd, hf_state)
         bound_state = state.bind_parameters(param)
 
         # Define sampler.
         star_vm = VM.from_device_prop(
             star_device.generate_device_property(
-                qubit_count=4,
+                qubit_count=8,
                 code_distance=7,
                 qec_cycle=TimeValue(1, TimeUnit.MICROSECOND),
-                physical_error_rate=ERROR_RATE
+                physical_error_rate=ERROR_RATE,
             )
         )
         sampler = self.create_concurrent_sampler_from_vm(star_vm)
 
         # Run QSCI.
-        eigs, _ = qsci(hamiltonian,
-                       [bound_state],
-                       sampler,
-                       total_shots=TOTAL_SHOTS,
-                       num_states_pick_out=4)
+        eigs, _ = qsci(
+            hamiltonian,
+            [bound_state],
+            sampler,
+            total_shots=TOTAL_SHOTS,
+            num_states_pick_out=30,
+        )
 
         print(f"The qsci gs energy is: {eigs[0]}")
 
-    def create_concurrent_sampler_from_vm(self, vm: VM,) -> ConcurrentSampler:
-        """Create a simple :class:`~ConcurrentSampler` using a
-        :class:`~SamplingBackend`."""
+    def create_concurrent_sampler_from_vm(
+        self,
+        vm: VM,
+    ) -> ConcurrentSampler:
+        """Create a simple :class:`~ConcurrentSampler` using a :class:`~SamplingBackend`.
+
+        Defines a wrapper around a virtual quantum machine (VM) that conforms to the ConcurrentSampler interface
+        expected by the quri_parts QSCI and estimation modules.
+        """
 
         def sampler(
             shot_circuit_pairs: Iterable[tuple[ImmutableQuantumCircuit, int]]
@@ -84,12 +115,13 @@ class QSCI():
 
         return sampler
 
-    def ccsd_param_to_circuit_param(self,
-                                    uccsd: TrotterUCCSD,
-                                    n_electrons: int,
-                                    t1: npt.NDArray[np.complex128],
-                                    t2: npt.NDArray[np.complex128],
-                                    ) -> Sequence[float]:
+    def ccsd_param_to_circuit_param(
+        self,
+        uccsd: TrotterUCCSD,
+        n_electrons: int,
+        t1: npt.NDArray[np.complex128],
+        t2: npt.NDArray[np.complex128],
+    ) -> Sequence[float]:
         in_param_list = uccsd.param_mapping.in_params
         param_list = []
 
@@ -111,7 +143,7 @@ class QSCI():
                 param_list.append(t2[i, j, a, b])
         return param_list
 
-molecule = gto.M(atom="H 0 0 0; H 0 0 1")
-qsci_method = QSCI()
-qsci_method.run(molecule=molecule)
 
+molecule = gto.M(atom="O 0 0 0; H 0 0 1; H 1 0 0", basis="sto3g")
+qsci_method = QSCI()
+qsci_method.run(molecule=molecule, frozen=[0, 4])
